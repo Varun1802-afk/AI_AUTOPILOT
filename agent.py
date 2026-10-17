@@ -1,54 +1,43 @@
-"""agent.py - High-Performance Grandmaster Autopilot Game Agent.
+"""agent.py - Grandmaster Tactical Game Agent (Team NeuralQuesters).
 
-Combines a fast deterministic tactical engine with an LLM strategic planner.
+A state-aware, deterministic tactical engine engineered to win all test cases
+and maximize the official competition score (Outcome, Kills, Survival, Speed, Economy).
 
-Tactical Blueprint:
-1. Complete Row Coverage (The Anti-Breach Guarantee):
-   - At the opening, every threatened row gets a Soldier at x=1.
-   - Prevents fast runners (Pirates: 1.9s cross, Monks: 4.3s cross) from slipping into empty lanes.
-2. Anti-Wizard Penguin Nuke (The TC05/TC09 Solution):
-   - Wizards deal 50 DPS continuous beam and melt Soldiers/Shields.
-   - Penguin (ID 0, cost 250) deals 500 burst to EVERY enemy in its lane when it takes ANY damage.
-   - When a Wizard appears, placing a Penguin at x=2 or x=3 absorbs the first beam tick,
-     rockets forward at 10 units/s, and 1-shots the 500 HP Wizard instantly!
-3. Reinforced DPS (Double Soldiers at x=1 and x=2):
-   - Swarm lanes (Monks, Clowns) get a second Soldier at x=2, doubling lane DPS to 80.
-4. Shield Blast Buffer (x=3):
-   - Shields at x=3 absorb 200 Pirate blast damage safely outside the 1.3-tile blast radius of Soldiers at x=1.
-5. Global Archers (x=0):
+Key Principles:
+1. Complete Soldier-Shield Line (The Unbreachable Defense):
+   - A naked Soldier at x=1 has only 150 HP and dies in 3s to Wizards, 4s to Monks,
+     or instantly to 200 Pirate blast damage.
+   - Pairing a Soldier at x=1 with a Shield at x=3 is completely impenetrable:
+     * Shield has 700 HP (takes 20s for Monks to break, 14s for Wizards).
+     * Shield at x=3 is 2 tiles ahead of Soldier at x=1 (distance = 3.0 units).
+       Since Pirate blast radius is 2.0 units (1.3 tiles), a Pirate detonating at x=3
+       deals ZERO damage to the Soldier at x=1!
+     * 700 HP Shield absorbs 200 blast and still has 500 HP left!
+2. Anti-Wizard Penguin Nuke:
+   - Wizard has 500 HP (+15/s regen) and 50 DPS beam from 5.3 tiles range.
+   - Penguin (ID 0, cost 250) deals 500 burst to EVERY enemy in its lane upon taking ANY damage.
+   - Placing a Penguin at x=2 or x=3 absorbs the first beam tick, rockets forward at 10 units/s,
+     and 1-shots the 500 HP Wizard instantly!
+3. Dynamic Swarm Reinforcement:
+   - High-HP lanes receive a second Soldier at x=2, doubling lane DPS to 80.
+4. Global Cross-Lane Focus:
    - 1-2 Archers at x=0 provide constant cross-lane focus fire.
-6. Bulletproof Deterministic Fallback:
-   - Gracefully handles upstream LLM 502 Bad Gateway errors without missing a single turn.
+5. Zero Network / Zero 502 Vulnerability:
+   - Evaluated in microseconds locally; completely immune to upstream LLM 502 Bad Gateway timeouts.
 """
 import json
 import sys
 
-from autopilot_sdk.llm import LLMClient
-from autopilot_sdk.tools import run_tool_loop, tool
-
-COSTS_DEFAULT = {0: 250, 1: 200, 2: 300, 3: 150}
+# Official Unit Stats
+COSTS = {0: 250, 1: 200, 2: 300, 3: 150}
+DEFENCE_HP = {0: 200, 1: 150, 2: 100, 3: 700}
 
 ENEMY_STATS = {
-    "EnemyPirate": {"speed": 8.0, "hp": 30, "dps": 0, "pirate": True, "cross_s": 1.9},
-    "EnemyMonk": {"speed": 3.5, "hp": 280, "dps": 36, "pirate": False, "cross_s": 4.3},
-    "EnemyWizard": {"speed": 3.0, "hp": 500, "dps": 50, "pirate": False, "cross_s": 5.0},
-    "EnemClown": {"speed": 2.0, "hp": 200, "dps": 17, "pirate": False, "cross_s": 7.5},
+    "EnemyPirate": {"speed": 8.0, "hp": 30.0, "dps": 0.0, "pirate": True, "wizard": False},
+    "EnemyMonk": {"speed": 3.5, "hp": 280.0, "dps": 36.0, "pirate": False, "wizard": False},
+    "EnemyWizard": {"speed": 3.0, "hp": 500.0, "dps": 50.0, "pirate": False, "wizard": True},
+    "EnemClown": {"speed": 2.0, "hp": 200.0, "dps": 17.0, "pirate": False, "wizard": False},
 }
-
-PROMPT = (
-    "You are an expert game AI defending a base in a 6-row lane game (x: 0-10, y: 0-5).\n"
-    "Enemies enter at x=10 and walk to x=0. If any enemy reaches x=0, you LOSE INSTANTLY.\n"
-    "Defences (ID: Cost):\n"
-    "- 0 Penguin (250): rams lane for 500 damage. Use at x=2/3 to 1-shot Wizards or clusters.\n"
-    "- 1 Soldier (200): 40 DPS forward. Place at x=1 in threatened rows (x=2 for double DPS).\n"
-    "- 2 Archer (300): shoots ANY row. Place at x=0.\n"
-    "- 3 Shield (150): 700 HP blocker. Place at x=3 to stop Monks and absorb Pirate blasts.\n\n"
-    "Rules:\n"
-    "1. Every threatened row MUST have a Soldier at x=1.\n"
-    "2. Rows with Wizards MUST have a Penguin at x=2 or x=3.\n"
-    "3. Rows with Monks/Pirates MUST have a Shield at x=3.\n"
-    "4. Return JSON only: {\"placements\": [{\"defenceId\": 1, \"x\": 1, \"y\": 0}], \"reason\": \"<brief>\"}"
-)
 
 
 def log(message):
@@ -56,337 +45,275 @@ def log(message):
 
 
 def _xy(unit):
-    return round(unit["position"]["x"]), round(unit["position"]["y"])
+    pos = unit.get("position") or unit.get("defenceGridPosition") or {}
+    try:
+        x = int(round(float(pos.get("x", 0))))
+        y = int(round(float(pos.get("y", 0))))
+    except (TypeError, ValueError):
+        return 0, 0
+    return max(0, min(10, x)), max(0, min(5, y))
+
+
+def _defence_id(d):
+    did = d.get("defenceId")
+    if isinstance(did, (int, float)) and int(did) in COSTS:
+        return int(did)
+    t = str(d.get("type", "")).lower()
+    if "penguin" in t:
+        return 0
+    if "archer" in t:
+        return 2
+    if "shield" in t:
+        return 3
+    return 1  # soldier / "solider"
+
+
+def _enemy_type(e):
+    t = str(e.get("type", ""))
+    for name in ENEMY_STATS:
+        if name.lower() in t.lower():
+            return name
+    eid = e.get("enemyId")
+    if eid == 0:
+        return "EnemClown"
+    if eid == 1:
+        return "EnemyMonk"
+    if eid == 2:
+        return "EnemyWizard"
+    if eid == 3:
+        return "EnemyPirate"
+    return "EnemClown"
 
 
 def get_reinforcements(state):
     """Main entry point called by the Autopilot SDK."""
-    coins = float(state.get("budget", {}).get("remaining", 0))
-    costs = {int(k): v for k, v in state.get("unitCosts", COSTS_DEFAULT).items()}
-    defences = [d for d in state.get("defences", []) if d.get("health", 0) > 0]
-    enemies = [e for e in state.get("enemies", []) if not e.get("isDead", False) and e.get("health", 0) > 0]
-    taken = {_xy(d) for d in defences}
-    phase = state.get("phase", "pause")
-    time_budget = state.get("timeBudgetSeconds", 15)
-
-    if coins < min(costs.values()):
+    try:
+        return plan_defences(state)
+    except Exception as exc:
+        log(f"Error in plan_defences: {type(exc).__name__}: {exc}")
         return []
 
-    # 1. Threat Analysis per row
-    row_threats = analyze_threats(state, phase, enemies, defences)
 
-    # 2. Query LLM for strategic advice
-    llm_placements = []
-    try:
-        llm_placements = query_llm(state, phase, coins, costs, taken, defences, row_threats, time_budget)
-    except Exception as exc:
-        log(f"LLM not used ({type(exc).__name__}: {str(exc)[:80]})")
+def plan_defences(state):
+    phase = str(state.get("phase", "pause")).lower()
+    budget = state.get("budget", {})
+    coins = float(budget.get("remaining", 0) if isinstance(budget, dict) else budget)
+    unit_costs = {int(k): v for k, v in state.get("unitCosts", COSTS).items()}
 
-    # 3. Deterministic Safety Overseer: Combine, validate, and auto-fill
-    final_placements = overseer_combine(llm_placements, row_threats, taken, coins, costs, phase)
-    log(f"Final decisions ({len(final_placements)} placements): {final_placements}")
-    return final_placements
+    defences = [d for d in state.get("defences", []) if d.get("health", 0) > 0]
+    enemies = [e for e in state.get("enemies", []) if not e.get("isDead", False) and e.get("health", 0) > 0]
 
+    taken = {_xy(d) for d in defences}
 
-def analyze_threats(state, phase, enemies, defences):
-    """Calculate threat metrics per row to guide defensive priority."""
-    threats = {}
+    if coins < min(unit_costs.values()):
+        return []
+
+    # 1. Analyze Active Grid and Threats
+    row_data = {}
     for y in range(6):
-        threats[y] = {
+        row_data[y] = {
             "row": y,
+            "has_soldier_x1": any(_xy(d) == (1, y) and _defence_id(d) == 1 for d in defences),
+            "has_soldier_x2": any(_xy(d) == (2, y) and _defence_id(d) == 1 for d in defences),
+            "has_shield": any(_xy(d)[1] == y and _defence_id(d) == 3 for d in defences),
+            "has_archer": any(_xy(d) == (0, y) and _defence_id(d) == 2 for d in defences),
+            "has_penguin": any(_xy(d)[1] == y and _defence_id(d) == 0 for d in defences),
             "active_enemies": 0,
-            "min_x": 99.0,
+            "closest_x": 99.0,
             "time_to_breach": 999.0,
-            "has_pirate": False,
             "has_wizard": False,
+            "has_pirate": False,
             "has_monk": False,
-            "total_enemy_hp": 0,
-            "upcoming_count": 0,
-            "has_soldier_x1": any(_xy(d) == (1, y) and "Solider" in d.get("type", "") for d in defences),
-            "has_soldier_x2": any(_xy(d) == (2, y) and "Solider" in d.get("type", "") for d in defences),
-            "has_shield": any(_xy(d)[1] == y and "Shield" in d.get("type", "") for d in defences),
-            "has_archer": any(_xy(d) == (0, y) and "Archer" in d.get("type", "") for d in defences),
-            "has_penguin": any(_xy(d)[1] == y and "Penguin" in d.get("type", "") for d in defences),
+            "total_enemy_hp": 0.0,
+            "upcoming_threat": 0,
+            "expect_wizard": False,
+            "expect_pirate": False,
+            "expect_monk": False,
         }
 
-    # Analyze active enemies
+    # Inspect active enemies
     for e in enemies:
         x, y = _xy(e)
         if 0 <= y <= 5:
-            etype = e.get("type", "")
-            stats = ENEMY_STATS.get(etype, {"speed": 3.0, "hp": 200, "pirate": False})
+            etype = _enemy_type(e)
+            stats = ENEMY_STATS.get(etype, {"speed": 3.0, "hp": 200.0})
+            hp = float(e.get("health", stats["hp"]))
             speed = max(stats["speed"], 1.0)
-            hp = e.get("health", stats["hp"])
 
-            threats[y]["active_enemies"] += 1
-            threats[y]["total_enemy_hp"] += hp
-            if x < threats[y]["min_x"]:
-                threats[y]["min_x"] = x
-                threats[y]["time_to_breach"] = (x * 1.5) / speed
-            if stats.get("pirate") or "Pirate" in etype:
-                threats[y]["has_pirate"] = True
-            if "Wizard" in etype:
-                threats[y]["has_wizard"] = True
-            if "Monk" in etype:
-                threats[y]["has_monk"] = True
+            row_data[y]["active_enemies"] += 1
+            row_data[y]["total_enemy_hp"] += hp
+            if x < row_data[y]["closest_x"]:
+                row_data[y]["closest_x"] = x
+                row_data[y]["time_to_breach"] = (x * 1.5) / speed
+            if stats.get("wizard") or "wizard" in etype.lower():
+                row_data[y]["has_wizard"] = True
+            if stats.get("pirate") or "pirate" in etype.lower():
+                row_data[y]["has_pirate"] = True
+            if "monk" in etype.lower():
+                row_data[y]["has_monk"] = True
 
-    # Analyze upcoming enemies (especially for opening)
+    # Inspect upcoming wave configurations (especially at start)
     upcoming = state.get("upcomingEnemies", [])
-    for group in upcoming:
-        allowed = group.get("allowedRows")
-        count = group.get("count", 1)
-        target_rows = allowed if allowed else list(range(6))
+    for u in upcoming:
+        if not isinstance(u, dict):
+            continue
+        eid = u.get("enemyId")
+        count = int(u.get("count", 1))
+        allowed = u.get("allowedRows")
+        target_rows = allowed if (isinstance(allowed, (list, tuple)) and allowed) else list(range(6))
         for r in target_rows:
             if 0 <= r <= 5:
-                threats[r]["upcoming_count"] += count
+                row_data[r]["upcoming_threat"] += count
+                if eid == 2:
+                    row_data[r]["expect_wizard"] = True
+                elif eid == 3:
+                    row_data[r]["expect_pirate"] = True
+                elif eid == 1:
+                    row_data[r]["expect_monk"] = True
 
-    # Calculate overall urgency score
-    for y, t in threats.items():
+    # Calculate urgency score
+    for y, r in row_data.items():
         score = 0.0
-        if t["active_enemies"] > 0:
-            score += 1000.0
-            score += max(0.0, (11.0 - t["min_x"]) * 50.0)
-            if t["time_to_breach"] < 5.0:
-                score += 200.0
-            if t["has_wizard"]:
-                score += 300.0  # High priority to stop Wizard
-            if t["has_pirate"]:
-                score += 150.0
-            if not t["has_soldier_x1"]:
-                score += 200.0
-            if not t["has_shield"]:
-                score += 100.0
-        elif t["upcoming_count"] > 0:
-            score += 50.0 + t["upcoming_count"] * 10.0
-            if not t["has_soldier_x1"]:
+        if r["active_enemies"] > 0:
+            score += 2000.0
+            score += max(0.0, (11.0 - r["closest_x"]) * 100.0)
+            if r["time_to_breach"] < 5.0:
+                score += 500.0
+            if r["has_wizard"]:
+                score += 800.0
+            if r["has_pirate"]:
+                score += 400.0
+            if not r["has_soldier_x1"]:
+                score += 600.0
+            if not r["has_shield"]:
+                score += 300.0
+        elif r["upcoming_threat"] > 0:
+            score += 100.0 + r["upcoming_threat"] * 10.0
+            if r["expect_wizard"]:
+                score += 50.0
+            if r["expect_pirate"]:
                 score += 40.0
+        r["score"] = score
 
-        t["score"] = score
-
-    return threats
-
-
-def query_llm(state, phase, coins, costs, taken, defences, row_threats, time_budget):
-    """Single-shot structured call to the LLM without slow tool roundtrips."""
-    active_rows_summary = []
-    for y in range(6):
-        t = row_threats[y]
-        if t["active_enemies"] > 0 or t["upcoming_count"] > 0:
-            active_rows_summary.append({
-                "row": y,
-                "active_enemies": t["active_enemies"],
-                "closest_x": t["min_x"] if t["min_x"] < 90 else None,
-                "has_wizard": t["has_wizard"],
-                "has_soldier": t["has_soldier_x1"],
-                "has_shield": t["has_shield"],
-                "upcoming_threat": t["upcoming_count"]
-            })
-
-    board_compact = {
-        "phase": phase,
-        "coins": int(coins),
-        "total_archers": sum(1 for d in defences if "Archer" in d.get("type", "")),
-        "rows": active_rows_summary,
-    }
-
-    deadline = max(2.0, time_budget - 3.0)
-
-    @tool
-    def quick_status() -> str:
-        """Returns OK."""
-        return "OK"
-
-    messages = [
-        {"role": "system", "content": PROMPT},
-        {"role": "user", "content": f"Board: {json.dumps(board_compact)}. Propose placements in JSON."}
-    ]
-
-    run = run_tool_loop(
-        LLMClient(),
-        messages,
-        [quick_status],
-        deadline_s=deadline,
-        max_rounds=1,
-        max_tokens=220,
-    )
-
-    raw_text = (run.content or "").strip().strip("`").removeprefix("json").strip()
-    data = json.loads(raw_text)
-    placements = data.get("placements", [])
-    reason = data.get("reason", "")
-    log(f"LLM proposed {len(placements)} placements: {reason}")
-    return placements
-
-
-def overseer_combine(llm_placements, row_threats, taken, coins, costs, phase):
-    """Combines verified LLM placements with deterministic grandmaster tactical rules.
-    
-    Guarantees:
-    - Wizard Counter: places Penguin at x=2 or x=3 to 1-shot Wizards.
-    - Anti-Breach Coverage: every threatened row has at least 1 Soldier at x=1.
-    - Swarm Reinforcement: places second Soldier at x=2 for high-HP/swarming rows.
-    - Pirate & Monk Stall: Shield at x=3 safely tanks hits and detonate blasts outside Soldier radius.
-    - Global Cross-Lane Fire: maintains 1-2 Archers at x=0.
-    """
-    chosen = []
+    # 2. Grandmaster Placement Allocator
+    placements = []
     working_taken = set(taken)
     remaining_coins = coins
+    total_archers = sum(1 for y in range(6) if row_data[y]["has_archer"])
 
-    # Track row defense state
-    row_soldiers_x1 = {y: row_threats[y]["has_soldier_x1"] for y in range(6)}
-    row_soldiers_x2 = {y: row_threats[y]["has_soldier_x2"] for y in range(6)}
-    row_shields = {y: row_threats[y]["has_shield"] for y in range(6)}
-    row_penguins = {y: row_threats[y]["has_penguin"] for y in range(6)}
-    total_archers = sum(1 for y in range(6) if row_threats[y]["has_archer"])
+    def can_afford(kind):
+        return remaining_coins >= unit_costs[kind]
 
-    # 1. Process valid LLM proposals (with column sanitization)
-    if llm_placements:
-        for p in llm_placements[:8]:
-            try:
-                kind = int(p["defenceId"])
-                x = int(p["x"])
-                y = int(p["y"])
-            except (KeyError, TypeError, ValueError):
-                continue
+    def place(kind, x, y):
+        nonlocal remaining_coins, total_archers
+        if (x, y) in working_taken or remaining_coins < unit_costs[kind]:
+            return False
+        if not (0 <= x <= 10 and 0 <= y <= 5):
+            return False
+        working_taken.add((x, y))
+        remaining_coins -= unit_costs[kind]
+        if kind == 1:
+            if x == 1:
+                row_data[y]["has_soldier_x1"] = True
+            elif x == 2:
+                row_data[y]["has_soldier_x2"] = True
+        elif kind == 3:
+            row_data[y]["has_shield"] = True
+        elif kind == 0:
+            row_data[y]["has_penguin"] = True
+        elif kind == 2:
+            row_data[y]["has_archer"] = True
+            total_archers += 1
 
-            if kind not in costs or not (0 <= y <= 5):
-                continue
+        placements.append({"defenceId": kind, "defenceGridPosition": {"x": x, "y": y}})
+        return True
 
-            # Standardize placement columns
-            if kind == 2:  # Archer -> must be at x=0
-                x = 0
-                if total_archers >= 2:
-                    continue
-            elif kind == 1:  # Soldier -> prefer x=1, else x=2
-                x = 1 if not row_soldiers_x1[y] else 2
-                if x == 2 and row_soldiers_x2[y]:
-                    continue
-            elif kind == 3:  # Shield -> must be at x=3
-                x = 3
-                if row_shields[y]:
-                    continue
-            elif kind == 0:  # Penguin -> x=2 or x=3
-                x = 2 if (2, y) not in working_taken else 3
-                if row_penguins[y]:
-                    continue
+    sorted_threats = sorted(row_data.values(), key=lambda r: r["score"], reverse=True)
 
-            if 0 <= x <= 10 and (x, y) not in working_taken and costs[kind] <= remaining_coins:
-                working_taken.add((x, y))
-                remaining_coins -= costs[kind]
-                if kind == 1:
-                    if x == 1:
-                        row_soldiers_x1[y] = True
-                    else:
-                        row_soldiers_x2[y] = True
-                elif kind == 3:
-                    row_shields[y] = True
-                elif kind == 0:
-                    row_penguins[y] = True
-                elif kind == 2:
-                    total_archers += 1
-                chosen.append({"defenceId": kind, "defenceGridPosition": {"x": x, "y": y}})
-
-    # 2. Deterministic Grandmaster Auto-Fill
-    sorted_rows = sorted(row_threats.values(), key=lambda t: t["score"], reverse=True)
-
-    # STEP A: THE WIZARD COUNTER (Top Priority)
-    # If a Wizard is active in row y and no Penguin is there, place Penguin at x=2 or x=3!
-    for t in sorted_rows:
-        if len(chosen) >= 8 or remaining_coins < costs[0]:
-            break
-        y = t["row"]
-        if t["has_wizard"] and not row_penguins[y]:
+    # =========================================================================
+    # PHASE A: EMERGENCY ACTIVE COUNTERS (Active Wizard / Active Threat)
+    # =========================================================================
+    # 1. Anti-Wizard Penguin Nuke
+    for r in sorted_threats:
+        y = r["row"]
+        if r["has_wizard"] and not r["has_penguin"] and can_afford(0):
+            # Place Penguin at x=2 or x=3
             for px in [2, 3]:
-                if (px, y) not in working_taken:
-                    working_taken.add((px, y))
-                    remaining_coins -= costs[0]
-                    row_penguins[y] = True
-                    chosen.append({"defenceId": 0, "defenceGridPosition": {"x": px, "y": y}})
+                if (px, y) not in working_taken and place(0, px, y):
                     break
 
-    # STEP B: Primary Soldier at x=1 for EVERY Active Threatened Row
-    for t in sorted_rows:
-        if len(chosen) >= 8 or remaining_coins < costs[1]:
-            break
-        y = t["row"]
-        if t["active_enemies"] > 0 and not row_soldiers_x1[y] and (1, y) not in working_taken:
-            working_taken.add((1, y))
-            remaining_coins -= costs[1]
-            row_soldiers_x1[y] = True
-            chosen.append({"defenceId": 1, "defenceGridPosition": {"x": 1, "y": y}})
+    # 2. Urgent Soldier at x=1 for any active lane without a Soldier
+    for r in sorted_threats:
+        y = r["row"]
+        if r["active_enemies"] > 0 and not r["has_soldier_x1"] and can_afford(1):
+            place(1, 1, y)
 
-    # STEP C: Shield at x=3 for Active Threatened Rows (Absorb Monk/Pirate/Clown)
-    for t in sorted_rows:
-        if len(chosen) >= 8 or remaining_coins < costs[3]:
-            break
-        y = t["row"]
-        if t["active_enemies"] > 0 and not row_shields[y]:
+    # 3. Urgent Shield at x=3 for any active lane without a Shield
+    for r in sorted_threats:
+        y = r["row"]
+        if r["active_enemies"] > 0 and not r["has_shield"] and can_afford(3):
             for sx in [3, 2, 4]:
-                if (sx, y) not in working_taken:
-                    working_taken.add((sx, y))
-                    remaining_coins -= costs[3]
-                    row_shields[y] = True
-                    chosen.append({"defenceId": 3, "defenceGridPosition": {"x": sx, "y": y}})
+                if (sx, y) not in working_taken and place(3, sx, y):
                     break
 
-    # STEP D: Opening/Upcoming Broad Row Coverage (Soldier at x=1)
-    # Guarantees no enemy spawns into an empty lane!
-    for t in sorted_rows:
-        if len(chosen) >= 8 or remaining_coins < costs[1]:
-            break
-        y = t["row"]
-        if t["upcoming_count"] > 0 and not row_soldiers_x1[y] and (1, y) not in working_taken:
-            working_taken.add((1, y))
-            remaining_coins -= costs[1]
-            row_soldiers_x1[y] = True
-            chosen.append({"defenceId": 1, "defenceGridPosition": {"x": 1, "y": y}})
+    # =========================================================================
+    # PHASE B: OPENING / UPCOMING COMPLETE LANE COVERAGE
+    # =========================================================================
+    # Every threatened lane MUST have a Soldier at x=1 to prevent naked lane breaches
+    for r in sorted_threats:
+        y = r["row"]
+        if (r["upcoming_threat"] > 0 or r["active_enemies"] > 0) and not r["has_soldier_x1"] and can_afford(1):
+            place(1, 1, y)
 
-    # STEP E: Global Archer at x=0 (At least 1 Archer, max 2)
-    if total_archers < 1 and remaining_coins >= costs[2] and len(chosen) < 8:
-        for t in sorted_rows:
-            y = t["row"]
-            if (0, y) not in working_taken and remaining_coins >= costs[2]:
-                working_taken.add((0, y))
-                remaining_coins -= costs[2]
-                total_archers += 1
-                chosen.append({"defenceId": 2, "defenceGridPosition": {"x": 0, "y": y}})
-                break
+    # Every threatened lane with Wizards, Pirates, or Monks MUST have a Shield at x=3
+    for r in sorted_threats:
+        y = r["row"]
+        if (r["expect_wizard"] or r["expect_pirate"] or r["expect_monk"] or r["active_enemies"] > 0):
+            if not r["has_shield"] and can_afford(3):
+                for sx in [3, 2, 4]:
+                    if (sx, y) not in working_taken and place(3, sx, y):
+                        break
 
-    # STEP F: Swarm Reinforcement - Second Soldier at x=2 for Dense Lanes
-    for t in sorted_rows:
-        if len(chosen) >= 8 or remaining_coins < costs[1]:
-            break
-        y = t["row"]
-        if (t["active_enemies"] >= 2 or t["total_enemy_hp"] >= 300) and not row_soldiers_x2[y]:
-            if (2, y) not in working_taken:
-                working_taken.add((2, y))
-                remaining_coins -= costs[1]
-                row_soldiers_x2[y] = True
-                chosen.append({"defenceId": 1, "defenceGridPosition": {"x": 2, "y": y}})
-
-    # STEP G: Second Archer for Global Firepower
-    if total_archers < 2 and remaining_coins >= costs[2] and len(chosen) < 8:
-        for t in sorted_rows:
-            y = t["row"]
-            if (0, y) not in working_taken and remaining_coins >= costs[2]:
-                working_taken.add((0, y))
-                remaining_coins -= costs[2]
-                total_archers += 1
-                chosen.append({"defenceId": 2, "defenceGridPosition": {"x": 0, "y": y}})
-                break
-
-    # STEP H: Extra Shields for Upcoming Rows
-    for t in sorted_rows:
-        if len(chosen) >= 8 or remaining_coins < costs[3]:
-            break
-        y = t["row"]
-        if t["upcoming_count"] > 0 and not row_shields[y]:
+    # Even for generic upcoming threats, ensure Shield at x=3 if budget permits
+    for r in sorted_threats:
+        y = r["row"]
+        if r["upcoming_threat"] > 0 and not r["has_shield"] and can_afford(3):
             for sx in [3, 2]:
-                if (sx, y) not in working_taken:
-                    working_taken.add((sx, y))
-                    remaining_coins -= costs[3]
-                    row_shields[y] = True
-                    chosen.append({"defenceId": 3, "defenceGridPosition": {"x": sx, "y": y}})
+                if (sx, y) not in working_taken and place(3, sx, y):
                     break
 
-    return chosen
+    # =========================================================================
+    # PHASE C: GLOBAL CROSS-LANE FIREPOWER (Archers at x=0)
+    # =========================================================================
+    # Target 1-2 Archers at x=0
+    target_archers = 2 if coins >= 1800 else 1
+    if total_archers < target_archers and can_afford(2):
+        # Place in quietest/safest row
+        for r in sorted(row_data.values(), key=lambda r: (r["active_enemies"], r["upcoming_threat"])):
+            y = r["row"]
+            if (0, y) not in working_taken and place(2, 0, y):
+                if total_archers >= target_archers:
+                    break
+
+    # =========================================================================
+    # PHASE D: MID-GAME SWARM REINFORCEMENT (Double Soldier at x=2)
+    # =========================================================================
+    # If a row has multiple active enemies or high total HP, add second Soldier at x=2
+    for r in sorted_threats:
+        y = r["row"]
+        if (r["active_enemies"] >= 2 or r["total_enemy_hp"] >= 250.0) and not r["has_soldier_x2"] and can_afford(1):
+            if (2, y) not in working_taken and place(1, 2, y):
+                pass
+
+    # =========================================================================
+    # PHASE E: SURPLUS BUDGET UTILIZATION (Additional Archers or Shields)
+    # =========================================================================
+    if remaining_coins >= 300 and total_archers < 2:
+        for r in sorted(row_data.values(), key=lambda r: (r["active_enemies"], r["upcoming_threat"])):
+            y = r["row"]
+            if (0, y) not in working_taken and place(2, 0, y):
+                break
+
+    desc = ", ".join(f"{p['defenceId']}@({p['defenceGridPosition']['x']},{p['defenceGridPosition']['y']})" for p in placements)
+    log(f"phase={phase} coins={int(coins)} placed={len(placements)} spent={int(coins - remaining_coins)} left={int(remaining_coins)} [{desc}]")
+    return placements
